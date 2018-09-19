@@ -1,5 +1,9 @@
-[0m[[0m[33mwarn[0m] [0m[0m/home/freeman/IdeaProjects/SparkInAction/src/main/scala/com/freeman/LoginCount.scala:378:16: Class com.freeman.LoginCount$DataMap$3 differs only in case from com.freeman.LoginCount$Datamap$3. Such classes will overwrite one another on case-insensitive filesystems.[0m
+[0m[[0m[33mwarn[0m] [0m[0m/home/freeman/IdeaProjects/SparkInAction/src/main/scala/com/freeman/LoginCount.scala:793:16: Class com.freeman.LoginCount$LogLine$3 differs only in case from com.freeman.LoginCount$Logline$3. Such classes will overwrite one another on case-insensitive filesystems.[0m
+[0m[[0m[33mwarn[0m] [0m[0m    case class LogLine(time: Long, ipAddr: String, sessId: String, url: String, method: String, respCode: Int, respTime: Int)[0m
+[0m[[0m[33mwarn[0m] [0m[0m               ^[0m
+[0m[[0m[33mwarn[0m] [0m[0m/home/freeman/IdeaProjects/SparkInAction/src/main/scala/com/freeman/LoginCount.scala:386:16: Class com.freeman.LoginCount$DataMap$3 differs only in case from com.freeman.LoginCount$Datamap$3. Such classes will overwrite one another on case-insensitive filesystems.[0m
 [0m[[0m[33mwarn[0m] [0m[0m    case class DataMap(timeStart:String, timeEnd: String){}[0m
 [0m[[0m[33mwarn[0m] [0m[0m               ^[0m
 [0m[[0m[33mwarn[0m] [0m[0mthere was one deprecation warning; re-run with -deprecation for details[0m
-[0m[[0m[33mwarn[0m] [0m[0mtwo warnings found[0m
+[0m[[0m[33mwarn[0m] [0m[0mthere were 5 feature warnings; re-run with -feature for details[0m
+[0m[[0m[33mwarn[0m] [0m[0mfour warnings found[0m

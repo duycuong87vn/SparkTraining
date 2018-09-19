@@ -7,12 +7,16 @@ import org.apache.spark.streaming._
 
 import scala.io.Source.fromFile
 import org.apache.spark.sql._
+import org.apache.spark.sql.functions.broadcast
 
 import scala.collection.mutable
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.spark.streaming.kafka010.{ConsumerStrategies, KafkaUtils, LocationStrategies}
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import java.util.Properties
+
+import com.mongodb.spark.sql.helpers.StructFields
+import org.apache.hadoop.mapred.lib
 
 import scala.collection.mutable.ListBuffer
 
@@ -35,7 +39,7 @@ import com.stratio.datasource.mongodb.config.{MongodbConfig, MongodbCredentials,
 import scala.annotation.tailrec
 import org.apache.kafka.common.serialization.Serializer
 
-
+import org.apache.spark.sql.expressions.Window
 object LoginCount {
 
   def currentActiveExecutors(sc: SparkContext): Seq[String] = {
@@ -74,7 +78,12 @@ object LoginCount {
 
     val ssc = new StreamingContext(sc, Durations.seconds(5))
     ssc.checkpoint(checkpointDirectory)
-    vp9DataMapStreaming(ssc)
+    //vp9DataMapStreaming(ssc)
+    //ch13Realtime(ssc, spark)
+    //testCh13Realtime(ssc, spark)
+    //ch3(spark)
+    ch5(spark, sc)
+    //mergeData(spark)
     ssc
   }
 
@@ -569,12 +578,137 @@ object LoginCount {
     lazy val instance = new KafkaProducerWrapper("")
   }
 
-  def ch13Realtime(ssc: StreamingContext, sparkSession: SparkSession): Unit = {
+  def testCh13Realtime(ssc: StreamingContext, sparkSession: SparkSession ): Unit ={
 
     //used for connecting to Kafka
     var brokerList: Option[String] = None
     //Spark checkpoint directory
-    var checkpointDir: String = "hdfs://10.13.11.42:9000/home/freeman/spark_in_action"
+    val checkpointDir: String = "hdfs://10.13.11.42:9000/home/freeman/spark_in_action"
+    //Kafka topic for reading log messages
+    var logsTopic: Option[String] = Some("weblogs")
+    //Kafka topic for writing the calculated statistics
+    var statsTopic: Option[String] = Some("stats")
+    //Session timeout in milliseconds
+    var SESSION_TIMEOUT_MILLIS = 2 * 60 * 1000 //2 minutes
+    //Number of RDD partitions to use
+    var numberPartitions = 3
+
+    val kafkaReceiverParams = Map[String, String](
+      "metadata.broker.list" -> "10.13.11.4:9092,10.13.11.4:9093,10.13.11.4:9094")
+
+    val kafkaBrokers = "10.13.11.4:9092,10.13.11.4:9093,10.13.11.4:9094"   // comma separated list of broker:host
+    val group = "realtime"
+    val kafkaParam = new mutable.HashMap[String, String]()
+    kafkaParam.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBrokers)
+    kafkaParam.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringDeserializer")
+    kafkaParam.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,"org.apache.kafka.common.serialization.StringDeserializer")
+    kafkaParam.put(ConsumerConfig.GROUP_ID_CONFIG, group)
+    kafkaParam.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest")
+    kafkaParam.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
+
+    val kafkaStream = KafkaUtils.createDirectStream(ssc,
+      LocationStrategies.PreferConsistent,
+      ConsumerStrategies.Subscribe[String, String](List("weblogs"), kafkaParam))
+
+    //2018-08-20 15:24:30.621 192.168.0.171 692fc808-f942-492f-9e50-b495109b7b70 sia.org/ads/2/234/clickfw GET 404 500
+    //2018-08-20 15:24:30.729 192.168.0.113 4baee20f-49f5-4b7d-917f-1569e5098a5c sia.org/ads/1/123/clickfw GET 200 500
+
+    case class Logline(time: Long, ipAddr: String, sessionID: String, url: String, method: String, responseCode: Int, responseTime: Int)
+    //responseTime: Time it took the server to respond to the request
+
+    val df = new SimpleDateFormat("yyyy-MM-dd hh:mm:ss.SSS")
+
+    val logStream = kafkaStream.flatMap(consumerRecord => {
+      val fields = consumerRecord.value().split(" ")
+      try{
+        List(Logline(df.parse(fields(0) + " " + fields(1)).getTime, fields(2), fields(3), fields(4), fields(5), fields(6).toInt, fields(7).toInt))
+      }catch{
+        case e: Exception => {
+          System.err.println("Wrong line format: " + consumerRecord + " -EXCEPTION- " + e)
+          List()
+        }
+      }
+    })
+
+    val logLinePerSecond = logStream.map(ls => ( (ls.time / 1000) * 1000, ls ))
+
+    val reqPerSecond = logLinePerSecond.combineByKey(
+        initialCombinerLogline => 1L,
+        (mergeValue: Long, logLine: Logline) => mergeValue + 1,
+        (mergeCombiner1: Long, mergeCombiner2: Long) => mergeCombiner1 + mergeCombiner2,
+        new HashPartitioner(numberPartitions),
+        true
+    )
+
+    val errorPerSecond = logLinePerSecond.filter(logLine => {
+      val resCode = logLine._2.responseCode / 100
+      resCode == 4 || resCode == 5
+    }).combineByKey(
+        initialCombinerLogLine => 1L,
+        (mergeValue: Long, logLine: Logline) => mergeValue + 1,
+        (mergeCombiner1: Long, mergeCombiner2: Long) => mergeCombiner1 + mergeCombiner2,
+        new HashPartitioner(numberPartitions),
+        true
+    )
+
+    val adUrlPattern = new Regex(".*/ads/(\\d+)/\\d+/clickfw", "adtype")      // urlmatch.group will get data into first () | (\\d+)
+    val adsPerSecondAndType = logLinePerSecond.flatMap(logLine => {
+      adUrlPattern.findFirstMatchIn(logLine._2.url) match {
+        case Some(urlMatch) => List( ((logLine._1, urlMatch.group("adtype")), logLine._2) )
+        case None => List()
+      }
+    }).combineByKey(  //this combineByKey counts all LogLines per timestamp and ad category
+        initialCombiner => 1.asInstanceOf[Long],
+        (mergeValue: Long, logLine: Logline) => mergeValue + 1,
+        (mergeCom1: Long, mergeCom2: Long) => mergeCom1 + mergeCom2,
+        new HashPartitioner(numberPartitions),
+        true
+    )
+
+    val maxTimeBySession = logStream.map(logLine => (logLine.sessionID, logLine.time)).reduceByKey((max1, max2) => Math.max(max1, max2))
+    //DStream[(Long, Long)]
+
+    // maintain session state
+    val stateBySession = maxTimeBySession.updateStateByKey((maxTimeNewValues: Seq[Long], maxTimeOldState: Option[Long]) => {
+      if(maxTimeNewValues.size == 0.0){
+        if(System.currentTimeMillis() - maxTimeOldState.get > SESSION_TIMEOUT_MILLIS){
+          None
+        }else{
+          maxTimeOldState
+        }
+      }else if(maxTimeOldState.isEmpty){
+        Some(maxTimeNewValues(0))
+      }else{
+        Some(Math.max(maxTimeNewValues(0), maxTimeOldState.get))
+      }
+    })
+
+    val sessionCount = stateBySession.count() // DStream[Long]
+
+    //data key types for the output map
+    val SESSION_COUNT = "SESS"
+    val REQ_PER_SEC = "REQ"
+    val ERR_PER_SEC = "ERR"
+    val ADS_PER_SEC = "AD"
+
+    val requests = reqPerSecond.map(rq => (rq._1, Map(REQ_PER_SEC -> rq._2)))
+    val errors = errorPerSecond.map(er => (er._1, Map(ERR_PER_SEC -> er._2)))
+    val finalSessionCount = sessionCount.map(sc => ( (System.currentTimeMillis() / 1000) * 1000, Map(SESSION_COUNT -> sc)) )
+
+    //maps each count to a tuple (timestamp, a Map containing the count per category under the key ADS_PER_SEC#<ad category>)
+    val ads = adsPerSecondAndType.map(ads => (ads._1._1, Map(s"$ADS_PER_SEC#${ads._1._2}" -> ads._2)))
+
+    val finalStats = finalSessionCount.union(requests).union(errors).union(ads).reduceByKey((m1, m2) => m1 ++ m2)
+
+  }
+
+  def ch13Realtime(ssc: StreamingContext, sparkSession: SparkSession): Unit = {
+
+
+    //used for connecting to Kafka
+    var brokerList: Option[String] = None
+    //Spark checkpoint directory
+    val checkpointDir: String = "hdfs://10.13.11.42:9000/home/freeman/spark_in_action"
     //Kafka topic for reading log messages
     var logsTopic: Option[String] = Some("weblogs")
     //Kafka topic for writing the calculated statistics
@@ -631,7 +765,7 @@ object LoginCount {
     //val conf = new SparkConf().setAppName("Streaming Log Analyzer")
     //val ssc = new StreamingContext(conf, Seconds(1))
 
-    ssc.checkpoint(checkpointDir)
+    //ssc.checkpoint(checkpointDir)
 
     //set up the receiving Kafka stream
     //println("Starting Kafka direct stream to broker list: "+brokerList.get)
@@ -666,6 +800,7 @@ object LoginCount {
         //val fields = t._2.split(" ")
         val fields = t.value().split(" ")
         try {
+          //df.parse --> Mon Aug 20 15:24:16 ICT 2018   ---> getTime() ---> TIMESTAMP
           List(LogLine(df.parse(fields(0) + " " + fields(1)).getTime(), fields(2), fields(3), fields(4), fields(5), fields(6).toInt, fields(7).toInt))
         }
         catch {
@@ -674,19 +809,27 @@ object LoginCount {
       }
     }// DStream[LogLine]
 
-
     //CALCULATE NUMBER OF SESSIONS
     //contains session id keys its maximum (last) timestamp as value
     val maxTimeBySession = logsStream.map(r =>  (r.sessId, r.time)).reduceByKey(
       (max1, max2) => {
         Math.max(max1, max2)
       })//DStream[(String, Long)]
+    /*maxTimeBySession.foreachRDD(a => {
+      a.collect().foreach(b => {
+        println("maxTimeBySession------" + b)
+      })
+    })*/
+    //maxTimeBySession------(14eaf33e-f8db-4be6-9328-94dca9123901,1534753125582)
+    //maxTimeBySession------(6746ef95-f4e4-4872-b824-f4762f7797e1,1534753128706)
 
 
     //update state by session id
     val stateBySession = maxTimeBySession.updateStateByKey((maxTimeNewValues: Seq[Long], maxTimeOldState: Option[Long]) => {
-      if (maxTimeNewValues.size == 0.0) //only old session exists
-      {
+      println("maxTimeNewValues-----> " + maxTimeNewValues)
+      println("maxTimeOldState-----> " + maxTimeOldState)
+      if (maxTimeNewValues.size == 0.0){ //only old session exists
+
         //check if the session timed out
         if (System.currentTimeMillis() - maxTimeOldState.get > SESSION_TIMEOUT_MILLIS)
           None //session timed out so remove it from the state
@@ -698,25 +841,50 @@ object LoginCount {
       else //both old and new events with this session id found; no need to check the timeout
         Some(Math.max(maxTimeNewValues(0), maxTimeOldState.get))
     })//updateStateByKey
+    //DStream[(String, Long)] // SessionID, timeStamp
+
     //returns a DStream with single-element RDDs containing only the total count
-    val sessionCount = stateBySession.count()
+    val sessionCount = stateBySession.count() // DStream[Long]
+    /*sessionCount.foreachRDD(a => {
+      a.collect().foreach(b => {
+        println("sessionCount -------------------------------> " + b)
+      })
+    })*/
 
     //logLinesPerSecond contains (time, LogLine) tuples
-    val logLinesPerSecond = logsStream.map(l => ((l.time / 1000) * 1000, l))
+    val logLinesPerSecond = logsStream.map(l => ((l.time / 1000) * 1000, l)) // DStream[(Long, LogLine)]    --> 1534566683962 ---> 1534566683000
+
+    /*logLinesPerSecond.foreachRDD(l => {
+      l.collect().foreach(a => {
+        println(a._1 + " <-------------------------------------------> " + a._2)
+      })
+    })*/
+//    1534566683000 <-------------------------------------------> LogLine(1534566683962,192.168.0.36,a1f8188d-1a37-454e-9fb2-6b9542c6125c,/,GET,200,500)
+//    1534566684000 <-------------------------------------------> LogLine(1534566684411,192.168.0.63,c5e8c04e-fe47-495b-a7b4-e547b01af4ce,/,GET,200,500)
+//    1534566684000 <-------------------------------------------> LogLine(1534566684821,192.168.0.213,fe484899-6afb-4d89-8425-b96719ee11ae,sia.org/ads/2/234/clickfw,GET,200,500)
+//    1534566680000 <-------------------------------------------> LogLine(1534566680093,192.168.0.233,f5dea552-a871-47cc-b65d-68d619546e02,sia.org/ads/3/56/clickfw,GET,200,500)
+//    1534566682000 <-------------------------------------------> LogLine(1534566682062,192.168.0.68,7f4f00c1-096f-4d60-9220-ffd97b8cee95,/,GET,200,500)
+
 
     //CALCULATE REQUESTS PER SECOND
     //this combineByKey counts all LogLines per unique second
-    val reqsPerSecond = logLinesPerSecond.combineByKey(
-      l => 1L,
-      (c: Long, ll: LogLine) => c + 1,
-      (c1: Long, c2: Long) => c1 + c2,
-      new HashPartitioner(numberPartitions),
-      true)
+    val reqsPerSecond = logLinesPerSecond.combineByKey[Long](
+      logLine => 1L,                                               // createCombiner  --> (key, 1L)     --> (key, initialCount) --> (1534566683000, 1L)
+      (c: Long, logLine: LogLine) => c + 1,                        // mergeValue      --> (key, 1L + 1) --> (key, count)        --> (1534566683000, 1L + 1)
+      (combiner1: Long, combiner2: Long) => combiner1 + combiner2, // mergeCombiner(merges all the values across the partitions in the executors
+                                                                        // and sends the data back to the driver) --> (key, countAcrossAllPartitions)
+      new HashPartitioner(numberPartitions),                       // Partitioner
+      true)                                        // MapsideCombine
+    //DStream[(Long, Long)]
+
 
     //CALCULATE ERRORS PER SECOND
     val errorsPerSecond = logLinesPerSecond.
       //leaves in only the LogLines with response code starting with 4 or 5
-      filter(l => { val respCode = l._2.respCode / 100; respCode == 4 || respCode == 5 }).
+      filter(l => {
+        val respCode = l._2.respCode / 100
+        respCode == 4 || respCode == 5
+      }).
       //this combineByKey counts all LogLines per unique second
       combineByKey(r => 1L,
       (c: Long, r: LogLine) => c + 1,
@@ -724,23 +892,33 @@ object LoginCount {
       new HashPartitioner(numberPartitions),
       true)
 
+
     //CALCULATE NUMBER OF ADS PER SECOND
-    val adUrlPattern = new Regex(".*/ads/(\\d+)/\\d+/clickfw", "adtype")
+    val adUrlPattern = new Regex(".*/ads/(\\d+)/\\d+/clickfw", "adtype")      // urlmatch.group will get data into first () | (\\d+)
     val adsPerSecondAndType = logLinesPerSecond.
       //filters out the LogLines whose URL's don't match the adUrlPattern.
       //LogLines that do match the adUrlPattern are mapped to tuples ((timestamp, parsed ad category), LogLine)
       flatMap(l => {
-      adUrlPattern.findFirstMatchIn(l._2.url) match {
-        case Some(urlmatch) => List(((l._1, urlmatch.group("adtype")), l._2))
-        case None => List()
-      }
-    }).
+        adUrlPattern.findFirstMatchIn(l._2.url) match {
+          case Some(urlmatch) => List( ((l._1, urlmatch.group("adtype")), l._2) )  // urlmatch regex.match
+                                                                // List(((1534739401000,3),LogLine(1534739401678,192.168.0.204,a0296c40-f68c-4f43-a325-8feca15b0286,sia.org/ads/3/56/clickfw,GET,200,500)))
+                                                                // List(((1534739404000,2),LogLine(1534739404211,192.168.0.207,b84a6085-27b5-4d92-a0db-119a61a9dc4f,sia.org/ads/2/234/clickfw,GET,200,500)))
+          case None => List()
+        }
+      }).
       //this combineByKey counts all LogLines per timestamp and ad category
       combineByKey(r => 1.asInstanceOf[Long],
       (c: Long, r: LogLine) => c + 1,
       (c1: Long, c2: Long) => c1 + c2,
       new HashPartitioner(numberPartitions),
       true)
+
+    /*adsPerSecondAndType.foreachRDD(a => {
+      a.collect().foreach(b => {
+        println("adsPerSecondAndType -------------------------------> " + b._1 + " -------- " + b._2)   // adsPerSecondAndType -------------------------------> (1534740814000,1) -------- 1
+      })
+    })*/
+
 
     //data key types for the output map
     val SESSION_COUNT = "SESS"
@@ -749,19 +927,42 @@ object LoginCount {
     val ADS_PER_SEC = "AD"
 
     //maps each count to a tuple (timestamp, a Map containing the count under the REQ_PER_SEC key)
-    val requests = reqsPerSecond.map(sc => (sc._1, Map(REQ_PER_SEC -> sc._2)))
+    val requests = reqsPerSecond.map(sc => (sc._1,Map(REQ_PER_SEC -> sc._2)))    //DStream[(Long, Map(String -> Long))]  (1534739401000, Map("REQ" -> 2))
+
     //maps each count to a tuple (timestamp, a Map containing the count under the ERR_PER_SEC key)
-    val errors = errorsPerSecond.map(sc => (sc._1, Map(ERR_PER_SEC -> sc._2)))
+    val errors = errorsPerSecond.map(sc => (sc._1, Map(ERR_PER_SEC -> sc._2)))  ////DStream[(Long, Map(String -> Long))]
+
+    /*sessionCount.foreachRDD(a => {
+      a.collect().foreach(b => {
+        println("-----------sessionCount: " + b)
+      })
+    })*/
+    println("sessionCount, " + sessionCount)
+
     //maps each count to a tuple (current time with milliseconds removed, a Map containing the count under the SESSION_COUNT key)
-    val finalSessionCount = sessionCount.map(c => ((System.currentTimeMillis / 1000) * 1000, Map(SESSION_COUNT -> c)))
+    val finalSessionCount = sessionCount.map(c => ((System.currentTimeMillis / 1000) * 1000, Map(SESSION_COUNT -> c)))  //DStream[(Long, Map(String -> Long))]
+    //1534739525000:(SESS->10)
+    //1534739555000:(SESS->10)
+
     //maps each count to a tuple (timestamp, a Map containing the count per category under the key ADS_PER_SEC#<ad category>)
     val ads = adsPerSecondAndType.map(stc => (stc._1._1, Map(s"$ADS_PER_SEC#${stc._1._2}" -> stc._2)))
+
+    //-----------ads: (1534748442000,Map(AD#3 -> 3))
+    //-----------ass: (1534748440000,Map(AD#1 -> 1))
+    /*ads.foreachRDD(a => {
+      a.collect().foreach(b => {
+        println("-----------adsPerSecondAndType: " + b)
+      })
+    })*/
+
 
     //all the streams are unioned and combined
     val finalStats = finalSessionCount.union(requests).union(errors).union(ads).
       //and all the Maps containing particular counts are combined into one Map per timestamp.
       //This one Map contains all counts under their keys (SESSION_COUNT, REQ_PER_SEC, ERR_PER_SEC, etc.).
-      reduceByKey((m1, m2) => m1 ++ m2)
+      reduceByKey((m1, m2) => m1 ++ m2)     // Map[String, Long] ++ Map[String,Long]
+
+
 
     //Each partitions uses its own Kafka producer (one per partition) to send the formatted message
     finalStats.foreachRDD(rdd => {
@@ -770,6 +971,7 @@ object LoginCount {
         val producer = KafkaProducerWrapper.instance
         partition.foreach {
           case (s, map) =>
+            println("s___ " + s + "  <---> map --" + map)
             producer.send(
               "stats",
               s.toString,
@@ -1151,6 +1353,286 @@ object LoginCount {
     //ssc.stop(false)
   }
 
+  def mergeData(spark: SparkSession): Unit ={
+    val sc = spark.sparkContext
+
+    case class Product(time: Int, name: String, price: Option[Int])
+    case class Rate(time: Int, value: Int)
+
+    val productPath = "file:///home/freeman/bigdata/data/mergeData/products.csv"
+    val ratePath = "file:///home/freeman/bigdata/data/mergeData/rate.csv"
+
+    /*val product = sc.textFile("file:///home/freeman/Works/bigdata/data/mergeTest/products.csv")
+    //val proSplit = product.map(_.split(","))
+    val proSplit = product.map(p => {
+      val tmpP = p.split(",")
+      List(Product(tmpP(0).toInt, tmpP(1), Some(0)))
+    })
+
+    val rate = sc.textFile("file:///home/freeman/Works/bigdata/data/mergeTest/rate.csv")
+    //val rateSplit  = rate.map(_.split(","))
+    val rateSplit = product.map(r => {
+      val tmpR = r.split(",")
+      List(Rate(tmpR(0).toInt, tmpR(1).toInt))
+    })*/
+
+    val proSchema = StructType(Array(
+      StructField("p_time", StringType, true),
+      StructField("name", StringType, true),
+      StructField("price", StringType, false)))
+
+    val rateSchema = StructType(Array(
+      StructField("r_time", StringType, true),
+      StructField("rate", StringType, true)))
+
+    val proFile = spark.read.format("com.databricks.spark.csv")
+      //.option("header", "true")
+      .option("inferSchema", "true")
+      .schema(proSchema)
+      .load(productPath)
+
+    val rateFile = spark.read.format("com.databricks.spark.csv")
+      //.option("header", "true")
+      .option("inferSchema", "true")
+      .schema(rateSchema)
+      .load(ratePath)
+
+    proFile.printSchema()
+    rateFile.printSchema()
+
+    proFile.show(10, false)
+    rateFile.show(10, true)
+
+    import spark.implicits._
+    val files_joinDF = proFile.join(broadcast(rateFile), proFile("p_time").equalTo(rateFile("r_time")), "inner")
+      .selectExpr("p_time", "name", "price", "r_time", "rate")
+      .withColumn("new_price", ($"rate") * ($"price"))
+
+    files_joinDF.printSchema()
+    files_joinDF.show(10, false)
+
+    //val files_joinDF = proFile.join(rateFile, proFile("p_time").equalTo(rateFile("r_time")), "inner")
+    files_joinDF.write.format("json").save("file:///home/freeman/bigdata/data/mergeData/output")
+  }
+
+  case class Post (commentCount:Option[Int], lastActivityDate:Option[java.sql.Timestamp],
+                   ownerUserId:Option[Long], body:String, score:Option[Int], creationDate:Option[java.sql.Timestamp],
+                   viewCount:Option[Int], title:String, tags:String, answerCount:Option[Int],
+                   acceptedAnswerId:Option[Long], postTypeId:Option[Long], id:Long)
+
+  def ch5(spark: SparkSession, sc: SparkContext): Unit ={
+
+    val itPostsRows = sc.textFile("file:///home/freeman/bigdata/data/spark_in_action/ch05/italianPosts.csv")   // RDD[String]
+
+
+
+    //commentCount —Number of comments related to the question/answer
+    //lastActivityDate —Date and time of the last modification
+    //ownerUserId —User ID of the owner
+    //body —Textual contents of the question/answer
+    //score —Total score based on upvotes and downvotes
+    //creationDate —Date and time of creation
+    //viewCount —View count
+    //title —Title of the question
+    //tags —Set of tags the question has been marked with
+    //answerCount —Number of related answers
+    //acceptedAnswerId —If a question contains the ID of its accepted answer
+    //postTypeId —Type of t
+    //id —Post’s unique ID
+
+    /*case class ItPost(commentCount: Int, lastActivityDate: Long, ownerUserId: Int, body: String, score: Int, creationDate: Long, viewCount: Int,
+                      title: String, tags: String, answerCount: Int, acceptedAnswerId: Int, postTypeId: Int, id: Int)
+    import spark.implicits._
+    val itPostsRDD = itPostsRows.flatMap(post => {
+      val x = post.split("~")
+      List(ItPost(x(0).toInt,x(1).toLong,x(2).toInt,x(3),x(4).toInt,x(5).toLong,x(6).toInt,x(7),x(8),x(9).toInt,x(10).toInt,x(11).toInt,x(12).toInt))
+    })
+    itPostsRDD.show(10)*/
+
+    //------------ CREATING A DATAFRAME FROM AN RDD OF TUPLES
+    val itPostsSplit = itPostsRows.map(_.split("~"))            // RDD[Array[String]]
+
+    import spark.implicits._
+    val itPostsRDD = itPostsSplit.map(x => (x(0),x(1),x(2),x(3),x(4),x(5),x(6),x(7),x(8),x(9),x(10),x(11),x(12))) // RDD [(String, String...)]
+    //val itPostsDFrame = itPostsRDD.toDF()
+    //itPostsDFrame.show(10)
+    val itPostsDF = itPostsRDD.toDF("commentCount", "lastActivityDate", "ownerUserId", "body", "score", "creationDate", "viewCount", "title", "tags", "answerCount", "acceptedAnswerId", "postTypeId", "id")
+    itPostsDF.printSchema
+
+    //------------CONVERTING RDDS TO DATAFRAMES USING CASE CLASSES
+    import java.sql.Timestamp
+    object StringImplicits {
+      implicit class StringImprovements(val s: String) {
+        import scala.util.control.Exception.catching
+        def toIntSafe = catching(classOf[NumberFormatException]) opt s.toInt
+        def toLongSafe = catching(classOf[NumberFormatException]) opt s.toLong
+        def toTimestampSafe = catching(classOf[IllegalArgumentException]) opt Timestamp.valueOf(s)
+      }
+    }
+
+    import StringImplicits._
+    def stringToPost(row: String): Post = {
+      val r = row.split("~")
+      Post(r(0).toIntSafe, r(1).toTimestampSafe, r(2).toLongSafe, r(3), r(4).toIntSafe, r(5).toTimestampSafe, r(6).toIntSafe, r(7), r(8), r(9).toIntSafe,
+        r(10).toLongSafe, r(11).toLongSafe, r(12).toLong)
+    }
+    val itPostsDFCase = itPostsRows.map(x => stringToPost(x)).toDF()
+    //itPostsDFCase.printSchema()
+
+    //-------------CONVERTING RDDS TO DATAFRAMES BY SPECIFYING A SCHEMA
+    import org.apache.spark.sql.types._
+
+    val postSchema = StructType(Seq(
+      StructField("commentCount", IntegerType, true),
+      StructField("lastActivityDate", TimestampType, true),
+      StructField("ownerUserId", LongType, true),
+      StructField("body", StringType, true),
+      StructField("score", IntegerType, true),
+      StructField("creationDate", TimestampType, true),
+      StructField("viewCount", IntegerType, true),
+      StructField("title", StringType, true),
+      StructField("tags", StringType, true),
+      StructField("answerCount", IntegerType, true),
+      StructField("acceptedAnswerId", LongType, true),
+      StructField("postTypeId", LongType, true),
+      StructField("id", LongType, false)
+    ))//StructType
+
+
+    def stringToRow(row:String): Row = {
+      val r = row.split("~")
+
+      Row(r(0).toIntSafe.getOrElse(null),
+        r(1).toTimestampSafe.getOrElse(null),
+        r(2).toLongSafe.getOrElse(null),
+        r(3),
+        r(4).toIntSafe.getOrElse(null),
+        r(5).toTimestampSafe.getOrElse(null),
+        r(6).toIntSafe.getOrElse(null),
+        r(7),
+        r(8),
+        r(9).toIntSafe.getOrElse(null),
+        r(10).toLongSafe.getOrElse(null),
+        r(11).toLongSafe.getOrElse(null),
+        r(12).toLong)
+    }
+
+    val rowRDD = itPostsRows.map(stringData => stringToRow(stringData))
+    val itPostsDFStruct = spark.createDataFrame(rowRDD, postSchema)
+    //println(itPostsDFStruct.columns)
+    //println(itPostsDFStruct.dtypes)
+
+    val postsDf = itPostsDFStruct
+    postsDf.printSchema()
+    postsDf.show(10)
+    //val postsIdBody = postsDf.select("id", "body")
+    //val postsIdBody = postsDf.select(postsDf.col("id"), postsDf.col("body"))
+    //val postsIdBody = postsDf.select(Symbol("id"), Symbol("body"))
+    //val postsIdBody = postsDf.select('id, 'body)
+    val postsIdBody = postsDf.select($"id", $"body")
+
+    //val postIds = postsIdBody.drop("body")
+    val countPostItaliano = postsIdBody.filter('body contains "Italiano").count()
+    println("-----countPostItaliano: " + countPostItaliano)
+    postsIdBody.show(10)
+
+    val noAnswer = postsDf.filter(('postTypeId === 1) and ('acceptedAnswerId isNull))
+    //noAnswer.printSchema()
+    //noAnswer.show(1, false)
+
+    postsDf.filter('postTypeId === 1).withColumn("ratio", 'viewCount / 'score).where('ratio < 35).show()
+
+    //The 10 most recently modified questions:
+    postsDf.filter('postTypeId === 1).orderBy('lastActivityDate desc).limit(10).show
+
+
+    import org.apache.spark.sql.functions._
+    val postActivePeriod = postsDf.filter('postTypeId === 1)
+      .withColumn("activePeriod", datediff('lastActivityDate, 'creationDate))
+      .orderBy('activePeriod desc)
+      .head.getString(3).replace("&lt;","<").replace("&gt;",">")
+
+    //println("postActivePeriod--------------" + postActivePeriod)
+
+    //postsDf.select(avg('score), max('score), count('score)).show
+
+    postsDf.filter('postTypeId === 1)
+        .select('ownerUserId, 'acceptedAnswerId, 'score, max('score).over(Window.partitionBy('ownerUserId)) as "maxPerUser")
+        .withColumn("toMax", 'maxPerUser - 'score)//.show(10)
+
+    postsDf.filter('postTypeId === 1)
+      .select('ownerUserId, 'id, 'creationDate,
+        lag('id, 1).over(Window.partitionBy('ownerUserId).orderBy('creationDate)) as "prev",
+        lead('id, 1).over(Window.partitionBy('ownerUserId).orderBy('creationDate)) as "next")
+      .orderBy('ownerUserId, 'id)//.show(50, false)
+
+    //val countTags = udf((tags: String) => "&lt;".r.findAllMatchIn(tags).length)
+    val countTags = spark.udf.register("countTags", (tags: String) => "&lt;".r.findAllMatchIn(tags).length)
+    postsDf.filter('postTypeId === 1).select('tags, countTags('tags) as "tagCnt")//.show(10, false)
+
+    //Section 5.1.4
+    //val cleanPosts = postsDf.na.drop()
+    //println("DF using na drop: " + cleanPosts.count())
+
+    //postsDf.na.fill(Map("viewCount" -> 0))
+
+    //val postsDfCorrected = postsDf.na.replace(Array("id", "acceptedAnswerId"), Map(1177 -> 3000)).show(5)
+
+    //-----
+    // Row.fromSeq()  -- // Create a Row from a Seq of values.
+    val postsMapped = postsDf.rdd.map(row => Row.fromSeq(
+      row.toSeq
+        .updated(3, row.getString(3).replace("&lt;", "<").replace("&gt;", ">"))
+        .updated(8, row.getString(8).replace("&lt;", "<").replace("&gt;", ">"))
+    ))
+
+    val postsDfNew = spark.createDataFrame(postsMapped, postsDf.schema)
+
+
+    postsDfNew.groupBy('ownerUserId, 'tags,
+      'postTypeId).count.orderBy('ownerUserId desc).show(5)
+
+    postsDfNew.groupBy('ownerUserId).agg(last('lastActivityDate) as('lastActivityDate), max('score)).filter(max('score) > 5).orderBy('ownerUserId).show(5, false)
+    //postsDfNew.groupBy('ownerUserId).agg(Map("lastActivityDate" -> "max", "score" -> "max")).orderBy('ownerUserId).show(10, false)
+
+    postsDfNew.groupBy('ownerUserId).agg(last('lastActivityDate) as('lastActivityDate), max('score).gt(5)).orderBy('lastActivityDate desc).show(5, false)
+
+    val smplDf = postsDfNew.where('ownerUserId >= 13 and 'ownerUserId <= 15)//.show(50)
+    //smplDf.groupBy('ownerUserId, 'tags, 'postTypeId).count.orderBy('ownerUserId).show()
+    //smplDf.orderBy('ownerUserId).show(5)
+    //smplDf.rollup('ownerUserId, 'tags, 'postTypeId).count.orderBy('ownerUserId).show()
+    smplDf.rollup('ownerUserId, 'tags, 'postTypeId).count.sort($"ownerUserId".desc_nulls_last, $"tags".asc_nulls_last, $"postTypeId".asc_nulls_last).show(5)
+
+
+    //--------------------
+    val itVotesRaw = sc.textFile("file:///home/freeman/bigdata/data/spark_in_action/ch05/italianVotes.csv")
+      .map(x => x.split("~"))
+
+
+    /*itVotesRaw.foreach(f => {
+      f.foreach(a => {
+        println("-------------a: " + a)
+      })
+    })*/
+
+    //2657~135~2~2013-11-22 00:00:00.0
+    val itVotesRows = itVotesRaw.map(row => Row(row(0).toLongSafe, row(1).toLongSafe, row(2).toIntSafe, Timestamp.valueOf(row(3))))
+    val votesSchema = StructType(Seq(
+      StructField("id", LongType, false),
+      StructField("postId", LongType, false),
+      StructField("voteTypeId", IntegerType, false),
+      StructField("creationDate", TimestampType, false)) )
+    val votesDf = spark.createDataFrame(itVotesRows, votesSchema).show(10)
+    //val postsVotes = postsDf.join(votesDf, postsDf("id") === 'postId)
+    //val postsVotes = postsDf.join(broadcast(votesDf), postsDf("id").equalTo(votesDf("postId")), "inner")
+
+    //val postsVotesOuter = postsDf.join(votesDf, postsDf("id") === 'postId, "outer")
+    //postsVotes.show(10)
+
+    /*val files_joinDF = proFile.join(broadcast(rateFile), proFile("p_time").equalTo(rateFile("r_time")), "inner")
+      .selectExpr("p_time", "name", "price", "r_time", "rate")
+      .withColumn("new_price", ($"rate") * ($"price"))*/
+  }
 
   def ch4(spark: SparkSession) = {
 
@@ -1281,11 +1763,14 @@ object LoginCount {
     // (user: String) : parameter with String Type
     // (String => Boolean) truyen vao String, tra ve boolean
     val isEmp: (String => Boolean) = (user: String) => bcEmployees.value.contains(user) // bcEmployees.value | Set[String] ---> contain(user) | Boolean
+
     val sqlFunc = spark.udf.register("SetContainsUdf", isEmp)   // UserDefinedFunction
 
     val filtered = ordered.filter(sqlFunc($"login")) // Dataset[Row]
     filtered.show()
     filtered.write.format("json").save("file:///home/freeman/bigdata/data/spark_in_action/ch03/emp-gh-push-output")
+
+
 
     //val tmpUDF = spark.udf.register("UpperCaseLogin", (name: String) => name == name.toUpperCase)
     //ordered.filter(tmpUDF($"login")).show()
